@@ -76,7 +76,9 @@ colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
 
 ### Run
-0) Download CARLA here: [CARLA_0916](https://autoware-files.s3.us-west-2.amazonaws.com/carla/CARLA_294096eb1-dirty.tar.gz)
+0) Download CARLA here: [CARLA_0916](https://autoware-files.s3.us-west-2.amazonaws.com/carla/CARLA_294096eb1-dirty.tar.gz).
+
+You can find the source code of the modified carla here: [carla-awcl](https://github.com/autowarefoundation/carla/tree/ue4-dev_autoware-carla-leaderboard)
 and Launch Carla with native DDS
 ```
 ./CarlaUE4.sh --ros2
