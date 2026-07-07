@@ -1,7 +1,7 @@
 evaluation:
   agent_setup:
     # Path to Agent's .py file to evaluate
-    agent: src/autoware_agent/aw_e2e.py
+    agent: src/tum_agents/autoware_agent/aw_priviliged.py
     # This is for the priviliged
     #agent: src/autoware_agent/aw_priviliged.py
     # Path to Agent's configuration file (default: "")

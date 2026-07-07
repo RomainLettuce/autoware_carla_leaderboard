@@ -147,9 +147,21 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._published_latest = False
         self._goal_mod_failure_counter = 0
         self._is_autonomous = False
+        self._engage_watchdog_counter = 0
+        self._run_step_count = 0
 
-        self._traffic_light_ids = set()  
+        self._traffic_light_ids = set()
         self._publish_cam_image = False # For Debugging
+
+        # Oracle
+        self._oracle_collision_count = 0
+        self._oracle_collision_events = []
+        self._oracle_destination_reached = False
+        self._collision_sensor = None
+        bp = self._world.get_blueprint_library().find('sensor.other.collision')
+        self._collision_sensor = self._world.spawn_actor(
+            bp, carla.Transform(), attach_to=self._vehicle)
+        self._collision_sensor.listen(self._oracle_on_collision)
     
     def sensors(self) -> list:
         # The privileged expert using Autoware doesn't need any sensors
@@ -246,10 +258,21 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
 
         # Goal
         self.publish_global_plan(position["position"])
-        # Engage if goal is published and not autonomous
-        if self._published_latest and not self._is_autonomous:
-            #self._engage_publisher.publish(Engage(engage=True))
-            print('enage')
+        # Engage watchdog: re-engage if route is set but autonomous mode dropped.
+        # Guard: wait 100 ticks (~10s) for localization/planning to initialize first.
+        # Stop once the final goal has been published (route complete).
+        self._run_step_count += 1
+        route_finished = self._global_plan_world_coord is not None and \
+                         self._route_index >= len(self._global_plan_world_coord) - 1
+        if self._published_latest and not self._is_autonomous \
+                and self._run_step_count > 100 and not route_finished:
+            self._engage_watchdog_counter += 1
+            if self._engage_watchdog_counter >= 20:
+                self._engage_publisher.publish(Engage(engage=True))
+                self._engage_watchdog_counter = 0
+                print('engage watchdog: requesting autonomous mode')
+        else:
+            self._engage_watchdog_counter = 0
 
         # IMU
         imu_msg = Imu()
@@ -319,7 +342,17 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
             print(
                 "\033[93mWARNING: Expecting a vehicle command with timestamp {} but the timestamp received was {} .\033[0m".format(carla_timestamp, control_timestamp),
                  sep=" ")
-        #print('FINAL!!!', control)
+
+        # Oracle: destination check
+        if not self._oracle_destination_reached and self._global_plan_world_coord:
+            target_loc = self._global_plan_world_coord[-1][0].location
+            ego_loc = self._vehicle.get_location()
+            dist = math.sqrt((ego_loc.x - target_loc.x)**2 +
+                             (ego_loc.y - target_loc.y)**2)
+            if dist < 10.0 and self._route_index >= len(self._global_plan_world_coord) - 1:
+                self._oracle_destination_reached = True
+                print('\033[92m[ORACLE] Destination reached (dist={:.2f}m)\033[0m'.format(dist))
+
         return control
 
     @staticmethod
@@ -367,7 +400,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
                 service_request = SetRoutePoints.Request()
                 service_request.header.frame_id = "map"
                 service_request.option.allow_goal_modification = True
-                service_request.option.allow_while_using_route = False
+                service_request.option.allow_while_using_route = True
                 service_request.goal = Pose(
                     position=Point(**next_pose_dict["position"]),
                     orientation=Quaternion(**next_pose_dict["orientation"])
@@ -388,7 +421,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
                 service_request = SetRoutePoints.Request()
                 service_request.header.frame_id = "map"
                 service_request.option.allow_goal_modification = True
-                service_request.option.allow_while_using_route = False
+                service_request.option.allow_while_using_route = True
                 service_request.goal = Pose(
                     position=Point(**next_pose_dict["position"]),
                     orientation=Quaternion(**next_pose_dict["orientation"])
@@ -516,6 +549,26 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         else:
             self._is_autonomous = False
 
+    def _oracle_on_collision(self, event):
+        other = event.other_actor
+        impulse = event.normal_impulse
+        intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
+        self._oracle_collision_count += 1
+        self._oracle_collision_events.append({
+            'frame': event.frame,
+            'other_actor': other.type_id,
+            'intensity': intensity,
+        })
+        print('\033[91m[ORACLE] Collision #{} with {} (intensity={:.1f})\033[0m'.format(
+            self._oracle_collision_count, other.type_id, intensity))
+
+    def oracle_summary(self):
+        return {
+            'collisions': self._oracle_collision_count,
+            'collision_events': self._oracle_collision_events,
+            'destination_reached': self._oracle_destination_reached,
+        }
+
     def _get_traffic_lights_from_lanelet(self, lanelet_marker_msg):
         print("Fetch Traffic Lights from Lanelet")
         pattern = re.compile(r"TLRegElemId:(\d+)")
@@ -530,6 +583,14 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         Destroy (clean-up) the agent
         :return:
         """
+        if self._collision_sensor is not None:
+            self._collision_sensor.destroy()
+            self._collision_sensor = None
+
+        summary = self.oracle_summary()
+        print('\033[96m[ORACLE] Summary: collisions={}, destination_reached={}\033[0m'.format(
+            summary['collisions'], summary['destination_reached']))
+
         self.ros_node.destroy_node()
         rclpy.shutdown()
         self.spin_thread.join()
