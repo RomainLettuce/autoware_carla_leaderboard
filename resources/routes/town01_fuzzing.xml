@@ -1,0 +1,18 @@
+<?xml version="1.0" ?>
+<routes>
+	<route id="0" town="Town01">
+		<weathers>
+			<weather route_percentage="100" cloudiness="5.0" precipitation="0.0" precipitation_deposits="0.0" wetness="0.0" wind_intensity="10.0" sun_azimuth_angle="-1.0" sun_altitude_angle="15.0" fog_density="2.0"/>
+		</weathers>
+		<waypoints>
+			<position x="88.40972900390625" y="261.330322265625" z="0"/>
+			<position x="88.4126968383789" y="280.830322265625" z="0"/>
+			<position x="88.41755676269531" y="312.830322265625" z="0"/>
+			<position x="114.1197738647461" y="330.59112548828125" z="0"/>
+			<position x="177.11978149414062" y="330.5978698730469" z="0"/>
+			<position x="241.11978149414062" y="330.6047058105469" z="0"/>
+			<position x="299.6199951171875" y="330.6099853515625" z="0"/>
+		</waypoints>
+		<scenarios/>
+	</route>
+</routes>

@@ -10,6 +10,7 @@ This module provides a ROS autonomous agent interface to control the ego vehicle
 # Long-Term you need to get this outside in a seperate ros package
 
 from __future__ import print_function
+import os
 import time
 import threading
 import queue
@@ -40,6 +41,7 @@ from visualization_msgs.msg import MarkerArray
 
 from autoware_agent.tum_ros_base_agent import TUMROSBaseAgent, BridgeHelper
 from autoware_agent.aw_converter import AutowareConverter
+from autoware_agent.npc_controller import NPCScenario, NPCVehicle, RelPos, Motion
 from autoware_adapi_v1_msgs.msg import LocalizationInitializationState, RouteState, OperationModeState
 from autoware_vehicle_msgs.msg import SteeringReport, VelocityReport, Engage
 from autoware_control_msgs.msg import Control
@@ -107,6 +109,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._engage_publisher = self.ros_node.create_publisher(Engage, "/autoware/engage", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         self_autoware_mode_subscriber = self.ros_node.create_subscription(OperationModeState, "/system/operation_mode/state", self._operation_mode_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         # Services for Goal Publishing
+        self._route_set_client = self.ros_node.create_client(SetRoutePoints, "/api/routing/set_route_points")
         self._route_service_client = self.ros_node.create_client(SetRoutePoints, "/api/routing/change_route_points")
         
         # Subscriber for Control
@@ -153,6 +156,30 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._traffic_light_ids = set()
         self._publish_cam_image = False # For Debugging
 
+        # NPC scenario
+        self._npc_scenario = None
+        npc_yaml = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))), 'config', 'npc_scenario.yaml')
+        if os.path.isfile(npc_yaml):
+            import yaml as _yaml
+            with open(npc_yaml) as f:
+                npc_cfg = _yaml.safe_load(f)
+            npcs = []
+            for entry in npc_cfg.get('npc_vehicles', []):
+                npcs.append(NPCVehicle(
+                    rel_pos=RelPos[entry['rel_pos']],
+                    motion=Motion[entry['motion']],
+                    base_speed=entry.get('base_speed', 40.0),
+                    lane_change_delay=entry.get('lane_change_delay', 30),
+                ))
+            if npcs:
+                self._npc_scenario = NPCScenario(npcs)
+                self._npc_scenario.spawn_all(
+                    self._world, self._client, self._vehicle, self._map,
+                    tm_port=8000)
+        else:
+            print('[NPC] No npc_scenario.yaml found — running without NPCs')
+
         # Oracle
         self._oracle_collision_count = 0
         self._oracle_collision_events = []
@@ -182,8 +209,6 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
 
     def run_step(self, input_data, timestamp):
         timestamp = carla_timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp.elapsed_seconds
-        # Autoware E2E
-
 
         # Autoware Priviliged Publisher
         time_sec = int(timestamp)
@@ -262,8 +287,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         # Guard: wait 100 ticks (~10s) for localization/planning to initialize first.
         # Stop once the final goal has been published (route complete).
         self._run_step_count += 1
-        route_finished = self._global_plan_world_coord is not None and \
-                         self._route_index >= len(self._global_plan_world_coord) - 1
+        route_finished = self._oracle_destination_reached
         if self._published_latest and not self._is_autonomous \
                 and self._run_step_count > 100 and not route_finished:
             self._engage_watchdog_counter += 1
@@ -310,6 +334,14 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
 
         self._object_publisher.publish(objects_msg)
 
+        # NPC update
+        if self._npc_scenario is not None:
+            ego_speed_ms = np.linalg.norm([
+                self._vehicle.get_velocity().x,
+                self._vehicle.get_velocity().y,
+            ])
+            self._npc_scenario.update(ego_speed_ms)
+
         # We set all autoware traffic lights to the state of the currently affecting traffic light
         traffict_light_state = self._awp_converter.get_current_traffic_light_state()
         traffic_light_msg = TrafficLightGroupArray()
@@ -343,15 +375,21 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
                 "\033[93mWARNING: Expecting a vehicle command with timestamp {} but the timestamp received was {} .\033[0m".format(carla_timestamp, control_timestamp),
                  sep=" ")
 
-        # Oracle: destination check
-        if not self._oracle_destination_reached and self._global_plan_world_coord:
+        # Oracle: destination check — terminate scenario on arrival
+        if self._global_plan_world_coord:
             target_loc = self._global_plan_world_coord[-1][0].location
             ego_loc = self._vehicle.get_location()
             dist = math.sqrt((ego_loc.x - target_loc.x)**2 +
                              (ego_loc.y - target_loc.y)**2)
-            if dist < 10.0 and self._route_index >= len(self._global_plan_world_coord) - 1:
+            if not self._oracle_destination_reached and dist < 10.0:
                 self._oracle_destination_reached = True
-                print('\033[92m[ORACLE] Destination reached (dist={:.2f}m)\033[0m'.format(dist))
+                print('\033[92m[ORACLE] Destination reached (dist={:.2f}m) — stopping scenario\033[0m'.format(dist))
+                try:
+                    import leaderboard.scenarios.scenario_manager as _sm_mod
+                    if getattr(_sm_mod, '_GLOBAL_MANAGER', None) is not None:
+                        _sm_mod._GLOBAL_MANAGER._running = False
+                except Exception as _e:
+                    print(f'[ORACLE] Could not stop scenario manager: {_e}')
 
         return control
 
@@ -365,122 +403,49 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._global_plan = [global_plan_gps[x] for x in ds_ids]
 
     def publish_global_plan(self, current_position):
-        if self._global_plan_world_coord and self._route_index < len(self._global_plan_world_coord) -1:
-            goal_wp = self._global_plan_world_coord[self._route_index]
-            goal_pose_dict = BridgeHelper.carla2ros_pose(
-                    goal_wp[0].location.x, goal_wp[0].location.y, goal_wp[0].location.z,
-                    np.deg2rad(goal_wp[0].rotation.roll), np.deg2rad(goal_wp[0].rotation.pitch), np.deg2rad(goal_wp[0].rotation.yaw),
-                    to_quat=True
-                )
-            # Only Publish a new goal when distance to last goal smaller 50 meter
-            dist = math.sqrt(
-                (goal_pose_dict["position"]["x"] - current_position["x"])**2 +
-                (goal_pose_dict["position"]["y"] - current_position["y"])**2 +
-                (goal_pose_dict["position"]["z"] - current_position["z"])**2
-            )
-            print("Distance to goal: ", dist)
-            if dist < 50.0 or self._goal_mod_failure_counter > 5: 
-                self._route_index += 1
-                self._published_latest = False
-                self._goal_mod_failure_counter = 0
+        if not self._global_plan_world_coord or self._published_latest:
+            return
 
-            # Publish only the first Checkpoint as a goal 
-            # Use reruting service to set the next goals
-                
-            if not self._published_latest:
-                next_wp = self._global_plan_world_coord[self._route_index]
-                next_pose_dict = BridgeHelper.carla2ros_pose(
-                    next_wp[0].location.x, next_wp[0].location.y, next_wp[0].location.z,
-                    np.deg2rad(next_wp[0].rotation.roll),
-                    np.deg2rad(next_wp[0].rotation.pitch),
-                    np.deg2rad(next_wp[0].rotation.yaw),
-                    to_quat=True
-                )
+        final_wp = self._global_plan_world_coord[-1][0]
+        goal_dict = BridgeHelper.carla2ros_pose(
+            final_wp.location.x, final_wp.location.y, final_wp.location.z,
+            np.deg2rad(final_wp.rotation.roll), np.deg2rad(final_wp.rotation.pitch), np.deg2rad(final_wp.rotation.yaw),
+            to_quat=True
+        )
 
-                service_request = SetRoutePoints.Request()
-                service_request.header.frame_id = "map"
-                service_request.option.allow_goal_modification = True
-                service_request.option.allow_while_using_route = True
-                service_request.goal = Pose(
-                    position=Point(**next_pose_dict["position"]),
-                    orientation=Quaternion(**next_pose_dict["orientation"])
-                )
-                future = self._route_service_client.call_async(service_request)
-                future.add_done_callback(self._handle_service_response)
-        else:
-            if not self._published_latest:
-                next_wp = self._global_plan_world_coord[-1]
-                next_pose_dict = BridgeHelper.carla2ros_pose(
-                    next_wp[0].location.x, next_wp[0].location.y, next_wp[0].location.z,
-                    np.deg2rad(next_wp[0].rotation.roll),
-                    np.deg2rad(next_wp[0].rotation.pitch),
-                    np.deg2rad(next_wp[0].rotation.yaw),
-                    to_quat=True
-                )
+        service_request = SetRoutePoints.Request()
+        service_request.header.frame_id = "map"
+        service_request.option.allow_goal_modification = True
+        service_request.option.allow_while_using_route = True
+        service_request.goal = Pose(
+            position=Point(**goal_dict["position"]),
+            orientation=Quaternion(**goal_dict["orientation"])
+        )
 
-                service_request = SetRoutePoints.Request()
-                service_request.header.frame_id = "map"
-                service_request.option.allow_goal_modification = True
-                service_request.option.allow_while_using_route = True
-                service_request.goal = Pose(
-                    position=Point(**next_pose_dict["position"]),
-                    orientation=Quaternion(**next_pose_dict["orientation"])
-                )
-                future = self._route_service_client.call_async(service_request)
-                future.add_done_callback(self._handle_service_response)
+        future = self._route_set_client.call_async(service_request)
+        future.add_done_callback(self._handle_service_response)
 
 
             
     def _handle_service_response(self, future):
         try:
-            self._published_latest = future.result().status.success
-            if not self._published_latest:
+            result = future.result()
+            self._published_latest = result.status.success
+            if self._published_latest:
+                print('[Route] set_route_points succeeded')
+            else:
                 self._goal_mod_failure_counter += 1
-            
-            # If Error is route not set yet publish a new goal
-            if future.result().status.message == 'The route is not set yet.':
-                self._published_latest = True
-                next_wp = self._global_plan_world_coord[self._route_index]
-                next_pose_dict = BridgeHelper.carla2ros_pose(
-                    next_wp[0].location.x, next_wp[0].location.y, next_wp[0].location.z,
-                    np.deg2rad(next_wp[0].rotation.roll),
-                    np.deg2rad(next_wp[0].rotation.pitch),
-                    np.deg2rad(next_wp[0].rotation.yaw),
-                    to_quat=True
-                )
-                
-                goal_pose_stamped = PoseStamped()
-                goal_pose_stamped.header.frame_id = "map"  # or whatever your frame is
-                goal_pose_stamped.pose = Pose(
-                    position=Point(**next_pose_dict["position"]),
-                    orientation=Quaternion(**next_pose_dict["orientation"])
-                )
-                print("Publishing goal")
-                self._goal_publisher.publish(goal_pose_stamped)
-            
-            print('Response:', future.result().status )
+                print(f'[Route] set_route_points failed (attempt {self._goal_mod_failure_counter}): {result.status}')
         except Exception as e:
-            print('Service call failed:', e)
+            print(f'[Route] service call exception: {e}')
     
     def _vehicle_control_cmd_callback(self, control_msg):
         control_timestamp, control = self._awp_converter.convert_control(control_msg)
-
 
         # Checks that the received control timestamp is not repeated.
         if self._last_control_timestamp is not None and abs(self._last_control_timestamp - control_timestamp) < EPSILON:
             print(
                 "\033[93mWARNING 11111: A new vehicle command with a repeated timestamp has been received {} .\033[0m".format(control_timestamp),
-                "\033[93mThis vehicle command will be ignored.\033[0m",
-                sep=" ")
-            return
-
-        # Checks that the received control timestamp is the expected one.
-        # We need to retrieve the simulation time directly from the CARLA snapshot instead of using the GameTime object to avoid
-        # a race condition between the execution of this callback and the update of the GameTime internal variables.
-        carla_timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp.elapsed_seconds
-        if abs(control_timestamp - carla_timestamp) > EPSILON:
-            print(
-                "\033[93mWARNING2222: Expecting a vehicle command with timestamp {} but the timestamp received was {} .\033[0m".format(carla_timestamp, control_timestamp),
                 "\033[93mThis vehicle command will be ignored.\033[0m",
                 sep=" ")
             return
@@ -583,8 +548,15 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         Destroy (clean-up) the agent
         :return:
         """
+        if self._npc_scenario is not None:
+            self._npc_scenario.destroy()
+            self._npc_scenario = None
+
         if self._collision_sensor is not None:
-            self._collision_sensor.destroy()
+            try:
+                self._collision_sensor.destroy()
+            except Exception:
+                pass
             self._collision_sensor = None
 
         summary = self.oracle_summary()

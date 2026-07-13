@@ -34,7 +34,7 @@ evaluation:
     tmp_visu: 0
   simulation_setup:
     # Name of the routes file to be executed
-    routes: resources/routes/town01_parking_pedestrian_crossing_short.xml
+    routes: resources/routes/town01_fuzzing.xml
     # Execute a specific set of routes (default: "")
     routes-subset: ""
     # Number of repetitions per route (default: 1)

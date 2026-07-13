@@ -1,0 +1,5 @@
+npc_vehicles:
+- base_speed: 40.0
+  lane_change_delay: 30
+  motion: Lane_keep_Decel
+  rel_pos: FRONT

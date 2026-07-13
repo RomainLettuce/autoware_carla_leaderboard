@@ -388,9 +388,8 @@ class AutowareConverter:
             carla.TrafficLightState.Yellow: TrafficLightElement.AMBER,
             carla.TrafficLightState.Green: TrafficLightElement.GREEN}
         
-        # Traffic lights
-        self._last_tl = TrafficLightElement.RED
-        self._steps_since_last_tl = 0
+        # Traffic lights — initialized GREEN (no light seen yet)
+        self._last_tl = TrafficLightElement.GREEN
     
     def _get_localization(self):
         ego_position = np.array([
@@ -615,22 +614,7 @@ class AutowareConverter:
     
     def get_current_traffic_light_state(self):
         if self._ego_vehicle.is_at_traffic_light():
-            self._steps_since_last_tl = 0
             tl_state = self._ego_vehicle.get_traffic_light_state()
             self._last_tl = self._carla_to_autoware_traffic_light_map[tl_state]
-            return self._carla_to_autoware_traffic_light_map[tl_state]
-        else:
-            # Sometimes the carla traffic light areas are no set correctly
-            # thats why we will keep the last tl state green for a while
-            if self._last_tl != TrafficLightElement.GREEN:
-                self._last_tl = TrafficLightElement.RED
-                return TrafficLightElement.RED
-            self._steps_since_last_tl += 1
-            if self._steps_since_last_tl > 30:
-                self._steps_since_last_tl = 0
-                self._last_tl = TrafficLightElement.RED
-                return TrafficLightElement.RED
-            
-            else:
-                return TrafficLightElement.GREEN
+        return self._last_tl
         
