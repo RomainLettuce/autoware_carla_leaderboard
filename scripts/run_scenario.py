@@ -8,6 +8,8 @@ Responsibilities:
      so no random background traffic is spawned.
   3. Run the leaderboard evaluator in-process.
 
+Coverage flush is handled inside aw_priviliged.py destroy() via _flush_coverage().
+
 Usage (run from repo root after sourcing carla_envs.sh):
   python scripts/run_scenario.py
   python scripts/run_scenario.py --rel_pos REAR --motion Lane_keep_Follow --speed 30
@@ -36,6 +38,7 @@ for _p in [
 # Monkey-patch BackgroundBehavior → no-op BEFORE any leaderboard import.
 # route_scenario.py does a module-level import of BackgroundBehavior, so this
 # must happen before 'from leaderboard.leaderboard_evaluator import main'.
+# Raise on failure: a silent miss here breaks fuzzing determinism.
 # ---------------------------------------------------------------------------
 try:
     import py_trees as _pt
@@ -53,7 +56,7 @@ try:
     _bg.BackgroundBehavior = _NoopBG
     print('[run_scenario] BackgroundActivity disabled — no random traffic will spawn')
 except Exception as _e:
-    print(f'[run_scenario] WARNING: could not patch BackgroundBehavior: {_e}')
+    raise RuntimeError(f'Could not patch BackgroundBehavior — fuzzing determinism broken: {_e}')
 
 # ---------------------------------------------------------------------------
 # Expose ScenarioManager instance globally so the agent can stop the scenario.
@@ -117,11 +120,9 @@ def _parse_args():
     p.add_argument('--no_npc', action='store_true',
                    help='Remove npc_scenario.yaml so no NPCs are spawned')
     p.add_argument('--conf', default='config/config.yaml',
-                   help='Leaderboard config path (default: config/config.yaml)')
+                   help='Leaderboard config path relative to repo root (default: config/config.yaml)')
     p.add_argument('--repeat', type=int, default=None,
                    help='Number of repetitions (overrides config repetitions field)')
-    p.add_argument('--reset_time', action='store_true',
-                   help='Clear persisted clock offset (use when restarting Autoware)')
     return p.parse_args()
 
 
@@ -144,14 +145,6 @@ def _write_npc_yaml(args):
 def main():
     args = _parse_args()
 
-    _TIME_OFFSET_FILE = '/tmp/aw_carla_time_offset'
-    if args.reset_time:
-        try:
-            os.remove(_TIME_OFFSET_FILE)
-            print('[run_scenario] Clock offset reset — starting from t=0')
-        except FileNotFoundError:
-            print('[run_scenario] No clock offset file found (already at t=0)')
-
     if args.no_npc:
         if os.path.isfile(NPC_YAML):
             os.remove(NPC_YAML)
@@ -161,17 +154,17 @@ def main():
     else:
         _write_npc_yaml(args)
 
-    # Build the config path; if --repeat is set, write a patched temp config.
-    conf_path = args.conf
+    # Always resolve conf relative to ROOT so CWD doesn't matter.
+    conf_path = os.path.join(ROOT, args.conf)
     tmp_conf = None
     if args.repeat is not None:
-        with open(os.path.join(ROOT, args.conf)) as f:
+        with open(conf_path) as f:
             cfg = _yaml.safe_load(f)
         cfg['evaluation']['challenge']['repetitions'] = args.repeat
         tmp_conf = os.path.join(ROOT, '.tmp_run_scenario_conf.yaml')
         with open(tmp_conf, 'w') as f:
             _yaml.safe_dump(cfg, f)
-        conf_path = os.path.relpath(tmp_conf, ROOT)
+        conf_path = tmp_conf
         print(f'[run_scenario] Repetitions: {args.repeat}')
 
     # Override sys.argv so the leaderboard's own argparse sees only its flag.

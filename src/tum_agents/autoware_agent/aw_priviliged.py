@@ -42,12 +42,11 @@ from visualization_msgs.msg import MarkerArray
 from autoware_agent.tum_ros_base_agent import TUMROSBaseAgent, BridgeHelper
 from autoware_agent.aw_converter import AutowareConverter
 from autoware_agent.npc_controller import NPCScenario, NPCVehicle, RelPos, Motion
-from autoware_adapi_v1_msgs.msg import LocalizationInitializationState, RouteState, OperationModeState
+from autoware_adapi_v1_msgs.msg import LocalizationInitializationState, OperationModeState
 from autoware_vehicle_msgs.msg import SteeringReport, VelocityReport, Engage
 from autoware_control_msgs.msg import Control
 from autoware_perception_msgs.msg import PredictedObjects, TrafficLightGroupArray, TrafficLightGroup, TrafficLightElement
 from tier4_vehicle_msgs.msg import ActuationStatusStamped
-from autoware_adapi_v1_msgs.srv import SetRoutePoints
 
 def get_entry_point():
     return 'AutowarePriviligedAgent'
@@ -108,10 +107,6 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._goal_publisher = self.ros_node.create_publisher(PoseStamped, "/rviz/routing/rough_goal", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         self._engage_publisher = self.ros_node.create_publisher(Engage, "/autoware/engage", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         self_autoware_mode_subscriber = self.ros_node.create_subscription(OperationModeState, "/system/operation_mode/state", self._operation_mode_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
-        # Services for Goal Publishing
-        self._route_set_client = self.ros_node.create_client(SetRoutePoints, "/api/routing/set_route_points")
-        self._route_service_client = self.ros_node.create_client(SetRoutePoints, "/api/routing/change_route_points")
-        
         # Subscriber for Control
         self._control_subscriber = self.ros_node.create_subscription(Control, "/control/command/control_cmd", self._vehicle_control_cmd_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
 
@@ -137,7 +132,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
 
     def setup(self, path_to_conf_file):
         self.track = Track.MAP
-        
+
         # Autoware Priviliged Stuff
         self._client = CarlaDataProvider.get_client()
         self._vehicle = CarlaDataProvider.get_hero_actor()
@@ -148,7 +143,6 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._route_index = 1 # Start with 1, because 0 is the start point
         self._last_published_route_index = None
         self._published_latest = False
-        self._goal_mod_failure_counter = 0
         self._is_autonomous = False
         self._engage_watchdog_counter = 0
         self._run_step_count = 0
@@ -208,7 +202,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
     # wait for the next control signal 
 
     def run_step(self, input_data, timestamp):
-        timestamp = carla_timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp.elapsed_seconds
+        timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp.elapsed_seconds
 
         # Autoware Priviliged Publisher
         time_sec = int(timestamp)
@@ -282,7 +276,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._velocity_report_publisher.publish(velocity_report_msg)
 
         # Goal
-        self.publish_global_plan(position["position"])
+        self.publish_global_plan(position["position"], time_sec, time_nsec)
         # Engage watchdog: re-engage if route is set but autonomous mode dropped.
         # Guard: wait 100 ticks (~10s) for localization/planning to initialize first.
         # Stop once the final goal has been published (route complete).
@@ -369,10 +363,10 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         except queue.Empty:
             control_timestamp, control = timestamp, self._last_control
 
-        carla_timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp.elapsed_seconds
-        if abs(control_timestamp - carla_timestamp) > EPSILON:
+        adjusted_timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp.elapsed_seconds
+        if abs(control_timestamp - adjusted_timestamp) > EPSILON:
             print(
-                "\033[93mWARNING: Expecting a vehicle command with timestamp {} but the timestamp received was {} .\033[0m".format(carla_timestamp, control_timestamp),
+                "\033[93mWARNING: Expecting a vehicle command with timestamp {} but the timestamp received was {} .\033[0m".format(adjusted_timestamp, control_timestamp),
                  sep=" ")
 
         # Oracle: destination check — terminate scenario on arrival
@@ -402,7 +396,7 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         self._global_plan_world_coord = [(global_plan_world_coord[x][0], global_plan_world_coord[x][1]) for x in ds_ids]
         self._global_plan = [global_plan_gps[x] for x in ds_ids]
 
-    def publish_global_plan(self, current_position):
+    def publish_global_plan(self, current_position, time_sec, time_nsec):
         if not self._global_plan_world_coord or self._published_latest:
             return
 
@@ -413,31 +407,17 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
             to_quat=True
         )
 
-        service_request = SetRoutePoints.Request()
-        service_request.header.frame_id = "map"
-        service_request.option.allow_goal_modification = True
-        service_request.option.allow_while_using_route = True
-        service_request.goal = Pose(
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = "map"
+        goal_pose.header.stamp.sec = time_sec
+        goal_pose.header.stamp.nanosec = time_nsec
+        goal_pose.pose = Pose(
             position=Point(**goal_dict["position"]),
             orientation=Quaternion(**goal_dict["orientation"])
         )
-
-        future = self._route_set_client.call_async(service_request)
-        future.add_done_callback(self._handle_service_response)
-
-
-            
-    def _handle_service_response(self, future):
-        try:
-            result = future.result()
-            self._published_latest = result.status.success
-            if self._published_latest:
-                print('[Route] set_route_points succeeded')
-            else:
-                self._goal_mod_failure_counter += 1
-                print(f'[Route] set_route_points failed (attempt {self._goal_mod_failure_counter}): {result.status}')
-        except Exception as e:
-            print(f'[Route] service call exception: {e}')
+        self._goal_publisher.publish(goal_pose)
+        self._published_latest = True
+        print('[Route] goal published via /rviz/routing/rough_goal')
     
     def _vehicle_control_cmd_callback(self, control_msg):
         control_timestamp, control = self._awp_converter.convert_control(control_msg)
@@ -543,6 +523,39 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
                 if match:
                     self._traffic_light_ids.add(int(match.group(1)))
 
+    def _flush_coverage(self):
+        import time
+        from std_srvs.srv import Trigger
+        _SERVICES = [
+            "/planning/scenario_planning/lane_driving/behavior_planning/"
+            "behavior_path_planner/coverage/flush",
+            "/planning/scenario_planning/lane_driving/motion_planning/"
+            "path_optimizer/coverage/flush",
+            "/planning/mission_planning/mission_planner/coverage/flush",
+        ]
+        _DIR = '/home/autoware/autoware/coverage_output'
+        os.makedirs(_DIR, exist_ok=True)
+        for service_name in _SERVICES:
+            print(f'[Coverage] calling {service_name}')
+            try:
+                flush_client = self.ros_node.create_client(Trigger, service_name)
+                if not flush_client.wait_for_service(timeout_sec=3.0):
+                    print(f'[Coverage] flush service not available — skipped')
+                    continue
+                future = flush_client.call_async(Trigger.Request())
+                deadline = time.time() + 5.0
+                while not future.done() and time.time() < deadline:
+                    time.sleep(0.05)
+                resp = future.result()
+                if resp is None:
+                    print(f'[Coverage] flush timed out')
+                elif resp.success:
+                    print(f'[Coverage] written to {resp.message}')
+                else:
+                    print(f'[Coverage] flush failed: {resp.message}')
+            except Exception as _e:
+                print(f'[Coverage] error: {_e}')
+
     def destroy(self):
         """
         Destroy (clean-up) the agent
@@ -562,6 +575,8 @@ class AutowarePriviligedAgent(TUMROSBaseAgent):
         summary = self.oracle_summary()
         print('\033[96m[ORACLE] Summary: collisions={}, destination_reached={}\033[0m'.format(
             summary['collisions'], summary['destination_reached']))
+
+        self._flush_coverage()
 
         self.ros_node.destroy_node()
         rclpy.shutdown()
